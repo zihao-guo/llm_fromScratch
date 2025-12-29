@@ -19,7 +19,7 @@ class PretrainDataset(Dataset):
         samples = []
         with open(path, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
-                # 提取每一行内容放到sample
+                # Extract each line and put it into a sample
                 data = json.loads(line.strip())
                 samples.append(data)
         return samples
