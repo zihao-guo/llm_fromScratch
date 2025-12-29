@@ -1,8 +1,8 @@
 # fork from https://github.com/jingyaogong/minimind/blob/master/model/model_minimind.py
 
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Config
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
+# -----------
+# MiniMind Config
+# -----------
 
 from transformers import PretrainedConfig
 
@@ -56,7 +56,7 @@ class MindConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
-        # 外推长度 = factor * original_max_position_embeddings = 32768
+        # Extended context = factor * original_max_position_embeddings = 16 * 2048 = 32768
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
@@ -71,18 +71,18 @@ class MindConfig(PretrainedConfig):
         # When use_moe is false, the following is invalid
         ####################################################
         self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok  # 每个token选择的专家数量
-        self.n_routed_experts = n_routed_experts  # 总的专家数量
-        self.n_shared_experts = n_shared_experts  # 共享专家
-        self.scoring_func = scoring_func  # 评分函数，默认为'softmax'
-        self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
-        self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
-        self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        self.num_experts_per_tok = num_experts_per_tok  # number of experts routed per token
+        self.n_routed_experts = n_routed_experts  # total expert count
+        self.n_shared_experts = n_shared_experts  # number of shared experts
+        self.scoring_func = scoring_func  # gating scoring function, default 'softmax'
+        self.aux_loss_alpha = aux_loss_alpha  # auxiliary load balance loss factor
+        self.seq_aux = seq_aux  # compute aux loss across entire sequence when True
+        self.norm_topk_prob = norm_topk_prob  # renormalize top-k probabilities
 
 
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Model
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
+# -----------
+# MiniMind Model
+# -----------
 
 import math
 import torch
@@ -95,6 +95,7 @@ from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
+# RMSNorm keeps activations numerically stable without introducing bias terms.
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -108,6 +109,7 @@ class RMSNorm(torch.nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 
+# Precompute rotary embeddings once (with optional YaRN scaling) and reuse at runtime.
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
@@ -149,6 +151,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+# Attention module with grouped-query attention and Flash attention fast-path.
 class Attention(nn.Module):
     def __init__(self, args: MindConfig):
         super().__init__()
@@ -170,7 +173,7 @@ class Attention(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # expects (cos, sin) rotary caches
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
@@ -183,7 +186,7 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
-        # kv_cache实现
+        # kv_cache handling
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -309,7 +312,7 @@ class MOEFeedForward(nn.Module):
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
+        # Select per-token experts via the gate
         topk_idx, topk_weight, aux_loss = self.gate(x)
         x = x.view(-1, x.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
@@ -317,7 +320,7 @@ class MOEFeedForward(nn.Module):
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=x.dtype)
             for i, expert in enumerate(self.experts):
-                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # enforce dtype match
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
@@ -334,10 +337,9 @@ class MOEFeedForward(nn.Module):
         idxs = flat_expert_indices.argsort()
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
         token_idxs = idxs // self.config.num_experts_per_tok
-        # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
-        # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
-        # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
-        # 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...依此类推
+        # Example: tokens_per_expert=[6,15,20,26] means 4 experts, and token_idxs chunks
+        # such as token_idxs[:6]=[3,7,19,21,24,25] belong to expert0 (tokens can repeat across experts).
+        # Subsequent slices (token_idxs[6:15], etc.) map to expert1, expert2, and so on.
         for i, end_idx in enumerate(tokens_per_expert):
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
@@ -376,6 +378,7 @@ class MindBlock(nn.Module):
         return hidden_states, present_key_value
 
 
+# MindModel stacks MindBlocks and returns hidden states plus aggregated MoE loss.
 class MindModel(nn.Module):
     def __init__(self, config: MindConfig):
         super().__init__()
@@ -432,6 +435,7 @@ class MindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
+# HF-compatible causal LM wrapper tying embeddings and LM head weights together.
 class MindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MindConfig
 
