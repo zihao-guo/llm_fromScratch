@@ -73,9 +73,9 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 
-# 继承nn.Module类
+# Inherit the nn.Module class
 class RMSNorm(nn.Module):
-# __init__初始化
+# __init__
     def __init__(self, dim:int, eps:float=1e-5):
         super().__init__()
         self.dim = dim
@@ -87,3 +87,72 @@ class RMSNorm(nn.Module):
 # forward
     def forward(self, x):
         return x * self.weight * self._norm(x.float()).type_as(x)
+    
+def precompute_freqs_cis(dim:int, end:int=int(32*1024), rope_base:flot=1e6,
+                         rope_scaling:Optional[dict]=None):
+# Write the initial RoPE formula
+    freqs = 1.0 / rope_base ** torch.arange(0, dim, 2)[:dim//2].float()/dim
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+
+    if rope_scaling is not None:
+            original_max, factor, beta_fast, beta_slow = (
+                rope_scaling.get("original_max_position_embeddings", 2048),
+                rope_scaling.get("factor", 4),
+                rope_scaling.get("beta_fast", 4.0),
+                rope_scaling.get("beta_slow", 1.0),
+            )
+
+            if end / original_max > 1.0:
+                # Calculate corr_dim
+                corr_dim = next(
+                    (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > original_max),
+                    dim // 2,
+                )
+                # Calculate power
+                power = torch.arange(0, dim // 2, device=freqs.device).float() / max(
+                    dim // 2 - 1, 1
+                )
+
+                # Calculate beta
+                beta = beta_slow + (beta_fast - beta_slow) * power
+
+                # CalculateScale
+                scale = torch.where(
+                    torch.arange(dim // 2, device=freqs.device) < corr_dim,
+                    (beta * factor - beta + 1) / (beta * factor), # high frequency
+                    1.0 / factor, # low frequency
+                )
+
+                # ApplyScale
+                freqs = freqs * scale
+
+            # Generate position index, multiplied by frequency
+            t = torch.arange(end, device=freqs.device)
+            freqs = torch.outer(t, freqs).float() # [end, dim//2]
+
+            # Returns a cos and sin
+            freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+            freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+
+            return freqs_cos, freqs_sin
+    
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # [a,b] -> [b,a]
+    def rotate_half(x):
+        # x.shape[-1]Take the end point of the last dimension
+        # x[..., x.shape[-1] // 2 :]Take the second half
+        # x[..., ：， x.shape[-1] // 2]Take the first half
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+
+    # Apply rotation encoding
+    # x_rotated = x * cos + rotate_half(x) * sin
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    return q_embed, k_embed
